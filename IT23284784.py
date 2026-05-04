@@ -3,6 +3,7 @@ import time
 import os
 import argparse
 import re
+from datetime import datetime
 from pathlib import Path
 import sys
 import openpyxl
@@ -58,12 +59,33 @@ DEFAULT_RETRY_WAIT_MS = 1000
 DEFAULT_TYPE_DELAY_MS = 30
 DEFAULT_TIMEOUT_MS = 60000
 DEFAULT_SLOW_MO_MS = 0
+DEFAULT_LOG_PREVIEW_CHARS = 70
 
 def _configure_stdout():
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
     except Exception:
         pass
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
+    except Exception:
+        pass
+
+def _log(level: str, message: str):
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] [{level}] {message}")
+
+def _banner(title: str):
+    line = "=" * 72
+    print(line)
+    print(title)
+    print(line)
+
+def _preview_text(value: str, max_chars: int = DEFAULT_LOG_PREVIEW_CHARS) -> str:
+    text = "" if value is None else str(value).replace("\n", " ").strip()
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars]}..."
 
 def _pick_existing_path(candidates):
     for p in candidates:
@@ -385,18 +407,26 @@ def _parse_args():
 
 def run_test():
     _configure_stdout()
+    started_at = time.time()
     args = _parse_args()
     args.excel = _resolve_path(args.excel)
     args.output = _resolve_path(args.output) if args.output else args.excel
 
+    _banner("Frontend Transliteration Test Runner")
+    _log("INFO", f"Excel file : {args.excel}")
+    _log("INFO", f"Sheet      : {args.sheet or '(active sheet)'}")
+    _log("INFO", f"URL        : {args.url}")
+    _log("INFO", f"Headless   : {args.headless}")
+    _log("INFO", f"Output file: {args.output}")
+
     if not args.excel or not os.path.exists(args.excel):
-        print(f"Error: File '{args.excel}' not found.")
+        _log("ERROR", f"File not found: {args.excel}")
         return
 
     try:
         wb = openpyxl.load_workbook(args.excel)
     except Exception as e:
-        print(f"Error reading Excel file: {e}")
+        _log("ERROR", f"Error reading Excel file: {e}")
         return
 
     if args.sheet and args.sheet in wb.sheetnames:
@@ -415,9 +445,9 @@ def run_test():
 
     if not input_col_idx:
         printable = [str(v) if v is not None else "" for v in header_values]
-        print("Error: Could not resolve input column.")
-        print(f"Header row: {header_row}")
-        print(f"Available columns: {printable}")
+        _log("ERROR", "Could not resolve input column.")
+        _log("INFO", f"Header row: {header_row}")
+        _log("INFO", f"Available columns: {printable}")
         return
 
     actual_col_name = args.actual_col or "Actual output"
@@ -430,12 +460,17 @@ def run_test():
     status_col_idx = status_col_idx or _ensure_column(ws, header_row, header_values, status_col_name)
 
     rows_total = max(0, int(ws.max_row or 0) - header_row)
-    print(f"Starting Frontend-Only test with {rows_total} rows...")
+    _log("INFO", f"Header row resolved to: {header_row}")
+    _log("INFO", f"Input column index      : {input_col_idx}")
+    _log("INFO", f"Expected column index   : {expected_col_idx or '(not found)'}")
+    _log("INFO", f"Actual column index     : {actual_col_idx}")
+    _log("INFO", f"Status column index     : {status_col_idx}")
+    _log("INFO", f"Rows to scan            : {rows_total}")
 
     with sync_playwright() as p:
         # 2. Launch Browser
         if args.headless:
-            print("Running in headless mode: browser UI will not be visible. Remove --headless to watch typing.")
+            _log("INFO", "Running in headless mode. Remove --headless to watch typing.")
         browser = p.chromium.launch(headless=args.headless, slow_mo=max(0, int(args.slow_mo_ms)))
         page = browser.new_page()
         page.set_default_timeout(max(1000, int(args.timeout_ms)))
@@ -448,9 +483,9 @@ def run_test():
             except Exception:
                 pass
             page.wait_for_selector("textarea", timeout=max(1000, int(args.timeout_ms)))
-            print("Frontend loaded successfully.")
+            _log("INFO", "Frontend loaded successfully.")
         except Exception as e:
-            print(f"Error loading frontend: {e}")
+            _log("ERROR", f"Error loading frontend: {e}")
             browser.close()
             return
 
@@ -459,7 +494,7 @@ def run_test():
             try:
                 input_locator, output_locator, action_locator = _find_chat_locators(page, int(args.timeout_ms))
             except Exception as e:
-                print(f"Error locating chat UI elements: {e}")
+                _log("ERROR", f"Error locating chat UI elements: {e}")
                 browser.close()
                 return
         else:
@@ -469,14 +504,25 @@ def run_test():
 
         # 4. Iterate Rows
         processed = 0
+        scanned_rows = 0
+        skipped_merged_rows = 0
+        skipped_empty_rows = 0
+        passed_rows = 0
+        failed_rows = 0
+        collected_rows = 0
+        ui_error_rows = 0
+
         for row_index in range(header_row + 1, int(ws.max_row or 0) + 1):
+            scanned_rows += 1
             if not _is_top_left_of_merged_cell(ws, row_index, input_col_idx):
+                skipped_merged_rows += 1
                 continue
 
             input_cell = _merged_top_left_cell(ws, row_index, input_col_idx)
             input_value = input_cell.value
             singlish_input = str(input_value).strip() if input_value is not None else ""
             if not singlish_input:
+                skipped_empty_rows += 1
                 continue
 
             expected_value = (
@@ -484,7 +530,10 @@ def run_test():
             )
             expected_sinhala = str(expected_value).strip() if expected_value is not None else ""
 
-            print(f"Testing [Row {row_index}]: {singlish_input}")
+            _log(
+                "INFO",
+                f"Row {row_index}: input='{_preview_text(singlish_input)}'"
+            )
 
             try:
                 _dismiss_overlays(page)
@@ -522,13 +571,32 @@ def run_test():
                 else:
                     status = "COLLECTED"
                 _set_cell_value(ws, row_index, status_col_idx, status)
-                print(f"  -> {status}")
+
+                if status == "PASS":
+                    passed_rows += 1
+                elif status == "FAIL":
+                    failed_rows += 1
+                else:
+                    collected_rows += 1
+
+                _log(
+                    "RESULT",
+                    f"Row {row_index}: {status} | actual='{_preview_text(actual_output)}'"
+                )
+                if status == "FAIL":
+                    _log(
+                        "DETAIL",
+                        f"Row {row_index}: expected='{_preview_text(expected_sinhala)}'"
+                    )
+
                 processed += 1
                 if args.save_every and int(args.save_every) > 0 and processed % int(args.save_every) == 0:
                     wb.save(args.output)
+                    _log("INFO", f"Auto-saved workbook at processed rows: {processed}")
                 
             except Exception as e:
-                print(f"Error in UI interaction: {e}")
+                ui_error_rows += 1
+                _log("ERROR", f"Row {row_index}: UI interaction failed: {e}")
                 try:
                     _set_cell_value(ws, row_index, status_col_idx, "UI Error")
                 except Exception:
@@ -536,6 +604,7 @@ def run_test():
                 if args.save_every and int(args.save_every) > 0:
                     try:
                         wb.save(args.output)
+                        _log("WARN", "Workbook saved after UI error.")
                     except Exception:
                         pass
 
@@ -544,7 +613,7 @@ def run_test():
                 wb.save(args.output)
             except Exception:
                 pass
-            print("Keeping browser open. Press CTRL+C to stop.")
+            _log("INFO", "Keeping browser open. Press CTRL+C to stop.")
             try:
                 while True:
                     page.wait_for_timeout(1000)
@@ -558,10 +627,21 @@ def run_test():
     try:
         wb.save(args.output)
     except Exception as e:
-        print(f"Error saving output file '{args.output}': {e}")
+        _log("ERROR", f"Error saving output file '{args.output}': {e}")
         return
 
-    print(f"Test completed. Results saved to {args.output}")
+    duration = time.time() - started_at
+    _banner("Execution Summary")
+    _log("INFO", f"Rows scanned         : {scanned_rows}")
+    _log("INFO", f"Rows processed       : {processed}")
+    _log("INFO", f"Rows skipped (merged): {skipped_merged_rows}")
+    _log("INFO", f"Rows skipped (empty) : {skipped_empty_rows}")
+    _log("INFO", f"PASS                 : {passed_rows}")
+    _log("INFO", f"FAIL                 : {failed_rows}")
+    _log("INFO", f"COLLECTED            : {collected_rows}")
+    _log("INFO", f"UI Error             : {ui_error_rows}")
+    _log("INFO", f"Duration             : {duration:.2f}s")
+    _log("INFO", f"Results saved to     : {args.output}")
 
 if __name__ == "__main__":
     run_test()
